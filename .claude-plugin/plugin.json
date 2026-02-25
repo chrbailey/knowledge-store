@@ -1,0 +1,10 @@
+{
+  "name": "knowledge-store",
+  "version": "0.1.0",
+  "description": "Searchable knowledge store — SQLite + FTS5 for captured session insights, with vote-weighted ranking and MCP tools.",
+  "author": {
+    "name": "Christopher Bailey",
+    "email": "chris@erpaccess.com"
+  },
+  "license": "MIT"
+}

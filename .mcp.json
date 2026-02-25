@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "knowledge-store": {
+      "command": "/Users/christopherbailey/.claude/plugins/knowledge-store/.venv/bin/python",
+      "args": ["-u", "/Users/christopherbailey/.claude/plugins/knowledge-store/server.py"]
+    }
+  }
+}
