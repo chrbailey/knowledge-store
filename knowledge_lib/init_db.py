@@ -60,6 +60,49 @@ CREATE INDEX IF NOT EXISTS idx_votes_hash ON votes(insight_hash);
 
 DEFAULT_DB_PATH = Path("/Volumes/OWC drive/Knowledge/knowledge.db")
 
+MIGRATIONS = [
+    # Migration 1: Add salience column (Phase 3)
+    (
+        "salience_column",
+        "ALTER TABLE insights ADD COLUMN salience REAL NOT NULL DEFAULT 0.5",
+    ),
+    # Migration 2: Add corroboration count (Phase 4)
+    (
+        "corroboration_column",
+        "ALTER TABLE insights ADD COLUMN corroboration_count INTEGER NOT NULL DEFAULT 0",
+    ),
+]
+
+
+def run_migrations(conn: sqlite3.Connection) -> None:
+    """Run pending schema migrations. Idempotent."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            name TEXT PRIMARY KEY,
+            applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+    conn.commit()
+
+    for name, sql in MIGRATIONS:
+        existing = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE name = ?", (name,)
+        ).fetchone()
+        if existing:
+            continue
+        try:
+            conn.execute(sql)
+            conn.execute(
+                "INSERT INTO schema_migrations (name) VALUES (?)", (name,)
+            )
+            conn.commit()
+        except sqlite3.OperationalError:
+            # Column already exists (manual migration), just record it
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (name) VALUES (?)", (name,)
+            )
+            conn.commit()
+
 
 def get_db_path(data_dir: Optional[str] = None) -> Path:
     if data_dir:
@@ -83,6 +126,7 @@ def init_db(db_path: Union[str, Path] = None) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
     conn.commit()
+    run_migrations(conn)
     return conn
 
 
@@ -97,6 +141,7 @@ def get_connection(db_path: Union[str, Path] = None) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.row_factory = sqlite3.Row
+    run_migrations(conn)
     return conn
 
 

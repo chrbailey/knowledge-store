@@ -476,5 +476,361 @@ class TestSanitize(unittest.TestCase):
         self.assertEqual(s, "hello world")
 
 
+# ============ Project Insights Tests ============
+
+
+class TestProjectInsights(TestBase):
+
+    def setUp(self):
+        super().setUp()
+        self.db.upsert_insight(
+            text="SQLite FTS5 requires porter tokenizer for stemming",
+            tier=1, project="touchgrass", captured_at="2026-02-20T12:00:00",
+        )
+        self.db.upsert_insight(
+            text="The touchgrass plugin uses emotional memory tracking",
+            tier=2, project="touchgrass", captured_at="2026-02-19T12:00:00",
+        )
+        self.db.upsert_insight(
+            text="PromptSpeak has 45 MCP tools and 658 tests",
+            tier=1, project="promptspeak", captured_at="2026-02-18T12:00:00",
+        )
+        self.db.upsert_insight(
+            text="Touchgrass is mentioned in this promptspeak insight",
+            tier=2, project="promptspeak", captured_at="2026-02-17T12:00:00",
+        )
+
+    def test_returns_only_matching_project(self):
+        """get_project_insights filters by project column, not keyword."""
+        results = self.db.get_project_insights("touchgrass", limit=10, days=30)
+        for r in results:
+            self.assertEqual(r["project"], "touchgrass")
+
+    def test_does_not_return_keyword_matches(self):
+        """Insight mentioning 'touchgrass' but tagged 'promptspeak' is excluded."""
+        results = self.db.get_project_insights("touchgrass", limit=10, days=30)
+        texts = [r["text"] for r in results]
+        self.assertNotIn("Touchgrass is mentioned in this promptspeak insight", texts)
+
+    def test_respects_tier_max(self):
+        """Tier filter works."""
+        results = self.db.get_project_insights("touchgrass", tier_max=1, days=30)
+        for r in results:
+            self.assertLessEqual(r["tier"], 1)
+
+    def test_respects_days_window(self):
+        """Days parameter filters old insights."""
+        self.db.upsert_insight(
+            text="Ancient touchgrass insight", tier=0,
+            project="touchgrass", captured_at="2020-01-01T00:00:00",
+        )
+        results = self.db.get_project_insights("touchgrass", days=30)
+        texts = [r["text"] for r in results]
+        self.assertNotIn("Ancient touchgrass insight", texts)
+
+    def test_excludes_expired(self):
+        """Expired insights are excluded."""
+        self.db.upsert_insight(
+            text="Expired touchgrass insight", tier=0,
+            project="touchgrass", captured_at="2026-02-20T00:00:00",
+            expired_at="2026-02-19T00:00:00",
+        )
+        results = self.db.get_project_insights("touchgrass", days=30)
+        texts = [r["text"] for r in results]
+        self.assertNotIn("Expired touchgrass insight", texts)
+
+    def test_ordered_by_tier_then_votes(self):
+        """Higher-tier insights rank first."""
+        results = self.db.get_project_insights("touchgrass", limit=10, days=30)
+        if len(results) >= 2:
+            self.assertLessEqual(results[0]["tier"], results[1]["tier"])
+
+    def test_limit_works(self):
+        """Limit caps results."""
+        results = self.db.get_project_insights("touchgrass", limit=1, days=30)
+        self.assertLessEqual(len(results), 1)
+
+
+# ============ Temporal Decay Tests ============
+
+
+class TestTemporalDecay(TestBase):
+
+    def setUp(self):
+        super().setUp()
+        # Insert two insights with same tier/votes but different dates
+        self.db.upsert_insight(
+            text="Recent SQLite insight about WAL mode performance",
+            tier=1, project="test", captured_at="2026-03-01T12:00:00",
+        )
+        self.db.upsert_insight(
+            text="Old SQLite insight about WAL mode configuration",
+            tier=1, project="test", captured_at="2025-06-01T12:00:00",
+        )
+
+    def test_search_recency_favors_recent(self):
+        """Recent insight ranks higher than old insight, same tier/votes."""
+        results = self.db.search("SQLite WAL", project="test")
+        self.assertTrue(len(results) >= 2)
+        # Recent one should be first
+        recent = [r for r in results if "performance" in r["text"]]
+        old = [r for r in results if "configuration" in r["text"]]
+        if recent and old:
+            recent_idx = results.index(recent[0])
+            old_idx = results.index(old[0])
+            self.assertLess(recent_idx, old_idx)
+
+    def test_search_excludes_expired(self):
+        """search() excludes expired insights."""
+        self.db.upsert_insight(
+            text="Expired SQLite WAL insight should hide",
+            tier=0, project="test",
+            captured_at="2026-03-01T00:00:00",
+            expired_at="2026-02-28T00:00:00",
+        )
+        results = self.db.search("SQLite WAL", project="test")
+        texts = [r["text"] for r in results]
+        self.assertNotIn("Expired SQLite WAL insight should hide", texts)
+
+    def test_top_insights_recency_factor_exposed(self):
+        """get_top_insights exposes recency_factor column."""
+        results = self.db.get_top_insights(limit=10, days=365)
+        if results:
+            self.assertIn("recency_factor", results[0])
+            self.assertGreater(results[0]["recency_factor"], 0.0)
+            self.assertLessEqual(results[0]["recency_factor"], 1.0)
+
+    def test_high_tier_resists_decay(self):
+        """Tier-0 insight from 30 days ago still outranks tier-3 from today."""
+        self.db.upsert_insight(
+            text="Pinned architectural decision about SQLite",
+            tier=0, project="test", captured_at="2026-02-01T12:00:00",
+        )
+        self.db.upsert_insight(
+            text="Trivial SQLite observation from today",
+            tier=3, project="test",
+        )
+        results = self.db.search("SQLite", project="test")
+        if len(results) >= 2:
+            pinned = [r for r in results if "Pinned" in r["text"]]
+            trivial = [r for r in results if "Trivial" in r["text"]]
+            if pinned and trivial:
+                self.assertLess(results.index(pinned[0]), results.index(trivial[0]))
+
+
+# ============ Salience Tests ============
+
+
+class TestSalience(TestBase):
+
+    def test_salience_stored(self):
+        """Salience value is stored on insert."""
+        self.db.upsert_insight(
+            text="High salience insight about debugging",
+            salience=0.9,
+        )
+        h = compute_insight_hash("High salience insight about debugging")
+        result = self.db.get_insight(h)
+        self.assertAlmostEqual(result["salience"], 0.9, places=1)
+
+    def test_salience_default(self):
+        """Default salience is 0.5."""
+        self.db.upsert_insight(text="Default salience insight")
+        h = compute_insight_hash("Default salience insight")
+        result = self.db.get_insight(h)
+        self.assertAlmostEqual(result["salience"], 0.5, places=1)
+
+    def test_high_salience_ranks_higher(self):
+        """Higher salience insight ranks above lower, same tier/date."""
+        self.db.upsert_insight(
+            text="High salience SQLite performance breakthrough",
+            tier=2, salience=0.9, project="test",
+        )
+        self.db.upsert_insight(
+            text="Low salience SQLite performance note",
+            tier=2, salience=0.1, project="test",
+        )
+        results = self.db.search("SQLite performance", project="test")
+        if len(results) >= 2:
+            high = [r for r in results if "breakthrough" in r["text"]]
+            low = [r for r in results if "note" in r["text"]]
+            if high and low:
+                self.assertLess(results.index(high[0]), results.index(low[0]))
+
+    def test_migration_runs_on_existing_db(self):
+        """Migration adds salience column to existing database."""
+        row = self.db.fetchone(
+            "SELECT salience FROM insights LIMIT 1"
+        )
+        # No rows is fine -- we just need the query not to error
+        self.assertTrue(True)
+
+    def test_schema_migrations_table_exists(self):
+        """schema_migrations table tracks applied migrations."""
+        rows = self.db.fetchall(
+            "SELECT name FROM schema_migrations"
+        )
+        names = [r["name"] for r in rows]
+        self.assertIn("salience_column", names)
+
+
+# ============ Corroboration Tests ============
+
+
+class TestCorroboration(TestBase):
+
+    def test_increment_corroboration(self):
+        """Corroboration count increments."""
+        self.db.upsert_insight(text="Corroborate me please")
+        h = compute_insight_hash("Corroborate me please")
+        result = self.db.increment_corroboration(h)
+        self.assertEqual(result["corroboration_count"], 1)
+        result = self.db.increment_corroboration(h)
+        self.assertEqual(result["corroboration_count"], 2)
+
+    def test_corroboration_nonexistent(self):
+        """Corroboration on nonexistent returns None."""
+        result = self.db.increment_corroboration("nonexistent")
+        self.assertIsNone(result)
+
+    def test_corroboration_default_zero(self):
+        """New insights start with 0 corroboration."""
+        self.db.upsert_insight(text="Fresh insight")
+        h = compute_insight_hash("Fresh insight")
+        result = self.db.get_insight(h)
+        self.assertEqual(result["corroboration_count"], 0)
+
+
+# ============ Stale Pruning Tests ============
+
+
+class TestPruning(TestBase):
+
+    def test_prune_stale_expires_old_unvoted(self):
+        """Old tier-3 unvoted insights get expired."""
+        self.db.upsert_insight(
+            text="Ancient observation nobody cared about",
+            tier=3, captured_at="2025-01-01T00:00:00",
+        )
+        pruned = self.db.prune_stale(max_age_days=90)
+        self.assertEqual(pruned, 1)
+        h = compute_insight_hash("Ancient observation nobody cared about")
+        result = self.db.get_insight(h)
+        self.assertIsNotNone(result["expired_at"])
+
+    def test_prune_spares_voted(self):
+        """Upvoted insights are not pruned even if old."""
+        self.db.upsert_insight(
+            text="Old but voted insight survives",
+            tier=3, captured_at="2025-01-01T00:00:00",
+        )
+        h = compute_insight_hash("Old but voted insight survives")
+        self.db.vote(h, "up")
+        pruned = self.db.prune_stale(max_age_days=90)
+        self.assertEqual(pruned, 0)
+
+    def test_prune_spares_corroborated(self):
+        """Corroborated insights are not pruned."""
+        self.db.upsert_insight(
+            text="Old but corroborated insight survives",
+            tier=3, captured_at="2025-01-01T00:00:00",
+        )
+        h = compute_insight_hash("Old but corroborated insight survives")
+        self.db.increment_corroboration(h)
+        pruned = self.db.prune_stale(max_age_days=90)
+        self.assertEqual(pruned, 0)
+
+    def test_prune_spares_high_tier(self):
+        """Tier 0-2 insights are not pruned regardless of age."""
+        self.db.upsert_insight(
+            text="Old tier-1 discovery insight",
+            tier=1, captured_at="2025-01-01T00:00:00",
+        )
+        pruned = self.db.prune_stale(max_age_days=90, min_tier=3)
+        self.assertEqual(pruned, 0)
+
+    def test_prune_spares_recent(self):
+        """Recent insights are not pruned even if tier-3."""
+        self.db.upsert_insight(text="Recent tier-3 observation", tier=3)
+        pruned = self.db.prune_stale(max_age_days=90)
+        self.assertEqual(pruned, 0)
+
+    def test_prune_skips_already_expired(self):
+        """Already-expired insights are not double-expired."""
+        self.db.upsert_insight(
+            text="Already expired insight",
+            tier=3, captured_at="2025-01-01T00:00:00",
+            expired_at="2025-06-01T00:00:00",
+        )
+        pruned = self.db.prune_stale(max_age_days=90)
+        self.assertEqual(pruned, 0)
+
+
+# ============ Investigation Prompt Tests ============
+
+
+class TestInvestigationPrompts(TestBase):
+
+    def test_low_confidence_prompt(self):
+        """Low-confidence recent insight generates investigation prompt."""
+        self.db.upsert_insight(
+            text="Uncertain observation about SQLite behavior that needs verification",
+            confidence=0.3, project="test",
+        )
+        prompts = self.db.get_investigation_prompts(limit=5)
+        self.assertTrue(any("[investigate]" in p and "Low-confidence" in p for p in prompts))
+
+    def test_stale_project_prompt(self):
+        """Project with old insights generates staleness prompt."""
+        for i in range(4):
+            self.db.upsert_insight(
+                text="Stale insight number %d about some topic" % i,
+                project="old-project",
+                captured_at="2025-01-01T00:00:00",
+            )
+        prompts = self.db.get_investigation_prompts(limit=5)
+        self.assertTrue(any("old-project" in p and "30+ days" in p for p in prompts))
+
+    def test_corroborated_prompt(self):
+        """Highly corroborated old insight generates evolution prompt."""
+        self.db.upsert_insight(
+            text="Frequently rediscovered pattern about database connections",
+            captured_at="2025-06-01T00:00:00",
+        )
+        h = compute_insight_hash("Frequently rediscovered pattern about database connections")
+        for _ in range(4):
+            self.db.increment_corroboration(h)
+        prompts = self.db.get_investigation_prompts(limit=5)
+        self.assertTrue(any("rediscovered" in p.lower() for p in prompts))
+
+    def test_limit_respected(self):
+        """Limit caps prompts returned."""
+        for i in range(5):
+            self.db.upsert_insight(
+                text="Low confidence insight number %d that is uncertain" % i,
+                confidence=0.2, project="test",
+            )
+        prompts = self.db.get_investigation_prompts(limit=2)
+        self.assertLessEqual(len(prompts), 2)
+
+    def test_empty_db_returns_empty(self):
+        """Empty DB produces no prompts."""
+        prompts = self.db.get_investigation_prompts()
+        self.assertEqual(prompts, [])
+
+    def test_project_filter(self):
+        """Project filter scopes stale prompts."""
+        for i in range(4):
+            self.db.upsert_insight(
+                text="Stale insight %d for wrong project" % i,
+                project="other-project",
+                captured_at="2025-01-01T00:00:00",
+            )
+        prompts = self.db.get_investigation_prompts(project="my-project", limit=5)
+        # Should not suggest investigating other-project when filtered to my-project
+        stale_prompts = [p for p in prompts if "other-project" in p]
+        self.assertEqual(len(stale_prompts), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

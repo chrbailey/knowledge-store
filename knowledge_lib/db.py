@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-from .init_db import get_db_path, init_db
+from .init_db import get_db_path, init_db, run_migrations
 
 
 def compute_insight_hash(text: str) -> str:
@@ -36,7 +36,8 @@ class KnowledgeDB:
                 self._conn = sqlite3.connect(str(self._path))
                 self._conn.execute("PRAGMA journal_mode=WAL")
                 self._conn.execute("PRAGMA foreign_keys=ON")
-            self._conn.row_factory = sqlite3.Row
+                self._conn.row_factory = sqlite3.Row
+                run_migrations(self._conn)
         return self._conn
 
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
@@ -83,6 +84,7 @@ class KnowledgeDB:
         domain: Optional[str] = None,
         captured_at: Optional[str] = None,
         insight_hash: Optional[str] = None,
+        salience: float = 0.5,
     ) -> Optional[int]:
         """Insert insight if hash doesn't exist. Returns rowid or None if duplicate."""
         if insight_hash is None:
@@ -103,13 +105,13 @@ class KnowledgeDB:
                     is_personal, upvotes, downvotes, entities, relationships,
                     relates_to, suggested_symbol, action, action_target,
                     action_reason, valid_from, valid_to, expired_at,
-                    drift_eligible, domain, captured_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    drift_eligible, domain, captured_at, salience)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (insight_hash, text, tier, source, confidence, session_id, project,
                  1 if is_personal else 0, upvotes, downvotes, entities, relationships,
                  relates_to, suggested_symbol, action, action_target,
                  action_reason, valid_from, valid_to, expired_at,
-                 drift_eligible, domain, captured_at),
+                 drift_eligible, domain, captured_at, salience),
             )
             if self.conn.total_changes > 0:
                 rowid = self.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -178,6 +180,7 @@ class KnowledgeDB:
                 FROM insights_fts
                 JOIN insights i ON i.id = insights_fts.rowid
                 WHERE {where_clause}
+                  AND i.expired_at IS NULL
                 ORDER BY (
                     insights_fts.rank
                     * CASE i.tier
@@ -186,7 +189,12 @@ class KnowledgeDB:
                         WHEN 2 THEN 1.0
                         ELSE 0.75
                       END
-                    * (1.0 + 0.1 * (i.upvotes - i.downvotes))
+                    * (1.0 + 0.1 * (i.upvotes - i.downvotes)
+                       + 0.05 * i.corroboration_count)
+                    * (1.0 / (1.0 + CAST(
+                        (julianday('now') - julianday(i.captured_at)) AS REAL
+                      ) * 0.02))
+                    * (0.5 + i.salience)
                 )
                 LIMIT ?""",
             tuple(params),
@@ -220,7 +228,7 @@ class KnowledgeDB:
         return self.get_insight(insight_ref)
 
     def get_top_insights(self, limit: int = 10, days: int = 7) -> List[dict]:
-        """Get top insights ranked by tier weight + net votes, for SessionStart injection."""
+        """Get top insights with unified ranking: tier * votes * recency * salience."""
         rows = self.fetchall(
             """SELECT *,
                       CASE tier
@@ -228,12 +236,27 @@ class KnowledgeDB:
                           WHEN 1 THEN 3.0
                           WHEN 2 THEN 2.0
                           ELSE 1.0
-                      END AS tier_weight
+                      END AS tier_weight,
+                      (1.0 / (1.0 + CAST(
+                          (julianday('now') - julianday(captured_at)) AS REAL
+                      ) * 0.02)) AS recency_factor
                FROM insights
                WHERE captured_at >= datetime('now', ? || ' days')
                  AND expired_at IS NULL
-               ORDER BY (tier_weight + (upvotes - downvotes)) DESC,
-                        captured_at DESC
+               ORDER BY (
+                   CASE tier
+                       WHEN 0 THEN 4.0
+                       WHEN 1 THEN 3.0
+                       WHEN 2 THEN 2.0
+                       ELSE 1.0
+                   END
+                   * (1.0 + 0.1 * (upvotes - downvotes)
+                      + 0.05 * corroboration_count)
+                   * (1.0 / (1.0 + CAST(
+                       (julianday('now') - julianday(captured_at)) AS REAL
+                   ) * 0.02))
+                   * (0.5 + salience)
+               ) DESC
                LIMIT ?""",
             (str(-days), limit),
         )
@@ -251,6 +274,177 @@ class KnowledgeDB:
             insight_hash=insight_hash,
         )
         return self.get_insight(insight_hash)
+
+    def get_project_insights(
+        self,
+        project: str,
+        limit: int = 10,
+        tier_max: int = 3,
+        days: int = 30,
+    ) -> List[dict]:
+        """Get insights for a specific project with unified ranking.
+
+        Uses the project column directly (NOT FTS5 keyword search).
+        This is the correct way to get project-scoped context at session start.
+        """
+        rows = self.fetchall(
+            """SELECT *,
+                      CASE tier
+                          WHEN 0 THEN 4.0
+                          WHEN 1 THEN 3.0
+                          WHEN 2 THEN 2.0
+                          ELSE 1.0
+                      END AS tier_weight,
+                      (1.0 / (1.0 + CAST(
+                          (julianday('now') - julianday(captured_at)) AS REAL
+                      ) * 0.02)) AS recency_factor
+               FROM insights
+               WHERE project = ?
+                 AND tier <= ?
+                 AND captured_at >= datetime('now', ? || ' days')
+                 AND expired_at IS NULL
+               ORDER BY (
+                   CASE tier
+                       WHEN 0 THEN 4.0
+                       WHEN 1 THEN 3.0
+                       WHEN 2 THEN 2.0
+                       ELSE 1.0
+                   END
+                   * (1.0 + 0.1 * (upvotes - downvotes)
+                      + 0.05 * corroboration_count)
+                   * (1.0 / (1.0 + CAST(
+                       (julianday('now') - julianday(captured_at)) AS REAL
+                   ) * 0.02))
+                   * (0.5 + salience)
+               ) DESC
+               LIMIT ?""",
+            (project, tier_max, str(-days), limit),
+        )
+        return [dict(r) for r in rows]
+
+    def increment_corroboration(self, insight_ref: str) -> Optional[dict]:
+        """Increment corroboration count for an existing insight.
+
+        Called when the stop hook re-extracts the same insight from a new session.
+        Higher corroboration = higher trust signal.
+        """
+        insight = self.get_insight(insight_ref)
+        if not insight:
+            return None
+
+        self.execute(
+            """UPDATE insights
+               SET corroboration_count = corroboration_count + 1,
+                   updated_at = datetime('now')
+               WHERE hash = ?""",
+            (insight["hash"],),
+        )
+        self.commit()
+        return self.get_insight(insight_ref)
+
+    def prune_stale(self, max_age_days: int = 90, min_tier: int = 3) -> int:
+        """Soft-expire insights that are old, unvoted, uncorroborated, and low-tier.
+
+        Criteria: older than max_age_days AND zero net votes AND
+        corroboration_count = 0 AND tier >= min_tier AND not already expired.
+
+        Returns count of pruned insights.
+        """
+        cursor = self.execute(
+            """UPDATE insights
+               SET expired_at = datetime('now'),
+                   updated_at = datetime('now')
+               WHERE captured_at < datetime('now', ? || ' days')
+                 AND (upvotes - downvotes) <= 0
+                 AND corroboration_count = 0
+                 AND tier >= ?
+                 AND expired_at IS NULL""",
+            (str(-max_age_days), min_tier),
+        )
+        pruned = cursor.rowcount
+        self.commit()
+        return pruned
+
+    def get_investigation_prompts(
+        self,
+        project: Optional[str] = None,
+        limit: int = 2,
+    ) -> List[str]:
+        """Generate investigation prompts from knowledge gaps.
+
+        Returns human-readable prompts about:
+        1. Topics with low-confidence recent insights
+        2. Projects with stale insights (30+ days, no recent activity)
+        3. Highly corroborated topics that may have evolved
+
+        Used by SessionStart to inject alongside factual context.
+        """
+        prompts = []  # type: List[str]
+
+        # 1. Low-confidence recent insights (last 14 days, confidence < 0.5)
+        low_conf_rows = self.fetchall(
+            """SELECT text, project, confidence, captured_at
+               FROM insights
+               WHERE confidence < 0.5
+                 AND captured_at >= datetime('now', '-14 days')
+                 AND expired_at IS NULL
+               ORDER BY captured_at DESC
+               LIMIT 3""",
+        )
+        for row in low_conf_rows:
+            d = dict(row)
+            text_preview = d["text"][:80]
+            proj = d.get("project") or "general"
+            prompts.append(
+                f"[investigate] Low-confidence insight ({proj}): \"{text_preview}...\" -- can you verify?"
+            )
+            if len(prompts) >= limit:
+                return prompts
+
+        # 2. Stale active projects -- projects where most recent insight is 30+ days old
+        stale_rows = self.fetchall(
+            """SELECT project, MAX(captured_at) AS last_insight, COUNT(*) AS insight_count
+               FROM insights
+               WHERE expired_at IS NULL
+                 AND project IS NOT NULL
+               GROUP BY project
+               HAVING MAX(captured_at) < datetime('now', '-30 days')
+                  AND COUNT(*) >= 3
+               ORDER BY insight_count DESC
+               LIMIT 3""",
+        )
+        for row in stale_rows:
+            d = dict(row)
+            proj = d["project"]
+            count = d["insight_count"]
+            if project and proj != project:
+                continue  # Only surface stale prompts for current project
+            prompts.append(
+                f"[investigate] {count} insights about '{proj}' haven't been updated in 30+ days -- still accurate?"
+            )
+            if len(prompts) >= limit:
+                return prompts
+
+        # 3. Highly corroborated insights that may have evolved
+        evolving_rows = self.fetchall(
+            """SELECT text, project, corroboration_count, captured_at
+               FROM insights
+               WHERE corroboration_count >= 3
+                 AND captured_at < datetime('now', '-30 days')
+                 AND expired_at IS NULL
+               ORDER BY corroboration_count DESC
+               LIMIT 3""",
+        )
+        for row in evolving_rows:
+            d = dict(row)
+            text_preview = d["text"][:80]
+            prompts.append(
+                f"[investigate] Frequently rediscovered ({d['corroboration_count']}x): \"{text_preview}...\" -- has this changed?"
+            )
+            if len(prompts) >= limit:
+                return prompts
+
+        return prompts[:limit]
 
     def stats(self) -> dict:
         """Aggregate stats: total, by tier/source/project, top voted."""
