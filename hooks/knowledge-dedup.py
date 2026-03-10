@@ -24,12 +24,14 @@ from knowledge_lib.db import KnowledgeDB  # noqa: E402
 
 
 def quality_key(row: dict) -> tuple:
-    """Sort key: lower tier is better, more votes, more corroboration, longer text."""
+    """Sort key for ascending sort: lower tuple = worse quality.
+    Best insight has lowest tier, most votes, most corroboration, longest text.
+    """
     return (
-        -row.get("tier", 3),                    # lower tier = better (negate for sort)
-        row.get("upvotes", 0) - row.get("downvotes", 0),  # net votes
+        -row.get("tier", 3),                    # tier 0 → 0, tier 3 → -3 (higher is better)
+        row.get("upvotes", 0) - row.get("downvotes", 0),
         row.get("corroboration_count", 0),
-        len(row.get("text", "")),                # longer = more context
+        len(row.get("text", "")),
     )
 
 
@@ -94,24 +96,13 @@ def main():
             print(f"  Expire: [{d['hash']}] tier={d['tier']}")
 
         if not dry_run:
-            # Transfer aggregate signals
-            if extra_up or extra_down or extra_corr:
-                db.conn.execute(
-                    "UPDATE insights SET upvotes = upvotes + ?, downvotes = downvotes + ?, "
-                    "corroboration_count = corroboration_count + ?, updated_at = datetime('now') "
-                    "WHERE hash = ?",
-                    (extra_up, extra_down, extra_corr, survivor["hash"])
-                )
-
-            # Expire duplicates
+            db.transfer_signals(
+                survivor["hash"],
+                upvotes=extra_up, downvotes=extra_down,
+                corroboration=extra_corr,
+            )
             for d in dupes:
-                db.conn.execute(
-                    "UPDATE insights SET expired_at = datetime('now'), "
-                    "updated_at = datetime('now') WHERE hash = ?",
-                    (d["hash"],)
-                )
-
-            db.conn.commit()
+                db.expire(d["hash"])
 
         total_dupes += len(members)
         total_expired += len(dupes)
@@ -129,15 +120,8 @@ def main():
                 continue
             print(f"  Expire: [{r['hash']}] {r['text'][:60]}...")
             if not dry_run:
-                db.conn.execute(
-                    "UPDATE insights SET expired_at = datetime('now'), "
-                    "updated_at = datetime('now') WHERE hash = ?",
-                    (r["hash"],)
-                )
+                db.expire(r["hash"])
                 retired_expired += 1
-
-        if not dry_run:
-            db.conn.commit()
 
     # Summary
     print(f"\n{'DRY RUN — ' if dry_run else ''}Summary:")

@@ -592,13 +592,13 @@ class TestTemporalDecay(TestBase):
         texts = [r["text"] for r in results]
         self.assertNotIn("Expired SQLite WAL insight should hide", texts)
 
-    def test_top_insights_recency_factor_exposed(self):
-        """get_top_insights exposes recency_factor column."""
+    def test_top_insights_returns_results(self):
+        """get_top_insights returns ranked results without derived columns."""
         results = self.db.get_top_insights(limit=10, days=365)
         if results:
-            self.assertIn("recency_factor", results[0])
-            self.assertGreater(results[0]["recency_factor"], 0.0)
-            self.assertLessEqual(results[0]["recency_factor"], 1.0)
+            # Removed tier_weight/recency_factor from SELECT (unused derived columns)
+            self.assertIn("tier", results[0])
+            self.assertIn("captured_at", results[0])
 
     def test_high_tier_resists_decay(self):
         """Tier-0 insight from 30 days ago still outranks tier-3 from today."""
@@ -683,15 +683,17 @@ class TestCorroboration(TestBase):
         """Corroboration count increments."""
         self.db.upsert_insight(text="Corroborate me please")
         h = compute_insight_hash("Corroborate me please")
-        result = self.db.increment_corroboration(h)
+        self.assertTrue(self.db.increment_corroboration(h))
+        result = self.db.get_insight(h)
         self.assertEqual(result["corroboration_count"], 1)
-        result = self.db.increment_corroboration(h)
+        self.assertTrue(self.db.increment_corroboration(h))
+        result = self.db.get_insight(h)
         self.assertEqual(result["corroboration_count"], 2)
 
     def test_corroboration_nonexistent(self):
-        """Corroboration on nonexistent returns None."""
+        """Corroboration on nonexistent returns False."""
         result = self.db.increment_corroboration("nonexistent")
-        self.assertIsNone(result)
+        self.assertFalse(result)
 
     def test_corroboration_default_zero(self):
         """New insights start with 0 corroboration."""

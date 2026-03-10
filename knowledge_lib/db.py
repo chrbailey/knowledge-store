@@ -18,6 +18,29 @@ def compute_insight_hash(text: str) -> str:
     return hashlib.sha256(normalized.encode('utf-8')).hexdigest()[:16]
 
 
+# Shared ranking expression for consistent scoring across all query methods.
+# Prefix is substituted at call site (e.g., "i." for JOINs, "" for direct queries).
+_RANKING_SQL = """(
+    CASE {pfx}tier
+        WHEN 0 THEN 4.0
+        WHEN 1 THEN 3.0
+        WHEN 2 THEN 2.0
+        ELSE 1.0
+    END
+    * (1.0 + 0.1 * ({pfx}upvotes - {pfx}downvotes)
+       + 0.05 * {pfx}corroboration_count)
+    * (1.0 / (1.0 + CAST(
+        (julianday('now') - julianday({pfx}captured_at)) AS REAL
+    ) * 0.02))
+    * (0.5 + {pfx}salience)
+)"""
+
+
+def ranking_sql(prefix: str = "") -> str:
+    """Return the ranking expression with an optional table prefix."""
+    return _RANKING_SQL.format(pfx=prefix)
+
+
 class KnowledgeDB:
     """Single connection wrapper for the knowledge store."""
 
@@ -99,7 +122,7 @@ class KnowledgeDB:
             relates_to = "[]"
 
         try:
-            self.execute(
+            cursor = self.execute(
                 """INSERT OR IGNORE INTO insights
                    (hash, text, tier, source, confidence, session_id, project,
                     is_personal, upvotes, downvotes, entities, relationships,
@@ -113,20 +136,18 @@ class KnowledgeDB:
                  action_reason, valid_from, valid_to, expired_at,
                  drift_eligible, domain, captured_at, salience),
             )
-            if self.conn.total_changes > 0:
-                rowid = self.execute("SELECT last_insert_rowid()").fetchone()[0]
+            if cursor.rowcount > 0:
+                rowid = cursor.lastrowid
                 # Sync to FTS5
                 self.execute(
                     """INSERT INTO insights_fts(rowid, text, project, source, entities)
                        VALUES (?, ?, ?, ?, ?)""",
                     (rowid, text, project or "", source, entities),
                 )
+                self.commit()
+                return rowid
             self.commit()
-            # Check if insert happened
-            row = self.fetchone(
-                "SELECT id FROM insights WHERE hash = ?", (insight_hash,)
-            )
-            return row["id"] if row else None
+            return None  # duplicate
         except sqlite3.IntegrityError:
             return None
 
@@ -181,21 +202,7 @@ class KnowledgeDB:
                 JOIN insights i ON i.id = insights_fts.rowid
                 WHERE {where_clause}
                   AND i.expired_at IS NULL
-                ORDER BY (
-                    insights_fts.rank
-                    * CASE i.tier
-                        WHEN 0 THEN 2.0
-                        WHEN 1 THEN 1.5
-                        WHEN 2 THEN 1.0
-                        ELSE 0.75
-                      END
-                    * (1.0 + 0.1 * (i.upvotes - i.downvotes)
-                       + 0.05 * i.corroboration_count)
-                    * (1.0 / (1.0 + CAST(
-                        (julianday('now') - julianday(i.captured_at)) AS REAL
-                      ) * 0.02))
-                    * (0.5 + i.salience)
-                )
+                ORDER BY insights_fts.rank * {ranking_sql("i.")}
                 LIMIT ?""",
             tuple(params),
         )
@@ -230,33 +237,11 @@ class KnowledgeDB:
     def get_top_insights(self, limit: int = 10, days: int = 7) -> List[dict]:
         """Get top insights with unified ranking: tier * votes * recency * salience."""
         rows = self.fetchall(
-            """SELECT *,
-                      CASE tier
-                          WHEN 0 THEN 4.0
-                          WHEN 1 THEN 3.0
-                          WHEN 2 THEN 2.0
-                          ELSE 1.0
-                      END AS tier_weight,
-                      (1.0 / (1.0 + CAST(
-                          (julianday('now') - julianday(captured_at)) AS REAL
-                      ) * 0.02)) AS recency_factor
+            f"""SELECT *
                FROM insights
                WHERE captured_at >= datetime('now', ? || ' days')
                  AND expired_at IS NULL
-               ORDER BY (
-                   CASE tier
-                       WHEN 0 THEN 4.0
-                       WHEN 1 THEN 3.0
-                       WHEN 2 THEN 2.0
-                       ELSE 1.0
-                   END
-                   * (1.0 + 0.1 * (upvotes - downvotes)
-                      + 0.05 * corroboration_count)
-                   * (1.0 / (1.0 + CAST(
-                       (julianday('now') - julianday(captured_at)) AS REAL
-                   ) * 0.02))
-                   * (0.5 + salience)
-               ) DESC
+               ORDER BY {ranking_sql()} DESC
                LIMIT ?""",
             (str(-days), limit),
         )
@@ -288,59 +273,87 @@ class KnowledgeDB:
         This is the correct way to get project-scoped context at session start.
         """
         rows = self.fetchall(
-            """SELECT *,
-                      CASE tier
-                          WHEN 0 THEN 4.0
-                          WHEN 1 THEN 3.0
-                          WHEN 2 THEN 2.0
-                          ELSE 1.0
-                      END AS tier_weight,
-                      (1.0 / (1.0 + CAST(
-                          (julianday('now') - julianday(captured_at)) AS REAL
-                      ) * 0.02)) AS recency_factor
+            f"""SELECT *
                FROM insights
                WHERE project = ?
                  AND tier <= ?
                  AND captured_at >= datetime('now', ? || ' days')
                  AND expired_at IS NULL
-               ORDER BY (
-                   CASE tier
-                       WHEN 0 THEN 4.0
-                       WHEN 1 THEN 3.0
-                       WHEN 2 THEN 2.0
-                       ELSE 1.0
-                   END
-                   * (1.0 + 0.1 * (upvotes - downvotes)
-                      + 0.05 * corroboration_count)
-                   * (1.0 / (1.0 + CAST(
-                       (julianday('now') - julianday(captured_at)) AS REAL
-                   ) * 0.02))
-                   * (0.5 + salience)
-               ) DESC
+               ORDER BY {ranking_sql()} DESC
                LIMIT ?""",
             (project, tier_max, str(-days), limit),
         )
         return [dict(r) for r in rows]
 
-    def increment_corroboration(self, insight_ref: str) -> Optional[dict]:
+    def increment_corroboration(self, insight_hash: str) -> bool:
         """Increment corroboration count for an existing insight.
 
         Called when the stop hook re-extracts the same insight from a new session.
-        Higher corroboration = higher trust signal.
+        Higher corroboration = higher trust signal. Returns True if row was updated.
         """
-        insight = self.get_insight(insight_ref)
-        if not insight:
-            return None
-
-        self.execute(
+        cursor = self.execute(
             """UPDATE insights
                SET corroboration_count = corroboration_count + 1,
                    updated_at = datetime('now')
                WHERE hash = ?""",
-            (insight["hash"],),
+            (insight_hash,),
         )
         self.commit()
-        return self.get_insight(insight_ref)
+        return cursor.rowcount > 0
+
+    def expire(self, insight_hash: str) -> bool:
+        """Soft-expire a single insight. Returns True if found and expired."""
+        cursor = self.execute(
+            """UPDATE insights SET expired_at = datetime('now'),
+                   updated_at = datetime('now')
+               WHERE hash = ? AND expired_at IS NULL""",
+            (insight_hash,),
+        )
+        self.commit()
+        return cursor.rowcount > 0
+
+    def promote(self, insight_hash: str, new_tier: int = 1,
+                confidence_boost: float = 0.2) -> bool:
+        """Promote an insight to a higher tier and re-index in FTS5."""
+        cursor = self.execute(
+            """UPDATE insights SET tier = ?,
+                   confidence = MIN(1.0, confidence + ?),
+                   updated_at = datetime('now')
+               WHERE hash = ?""",
+            (new_tier, confidence_boost, insight_hash),
+        )
+        if cursor.rowcount == 0:
+            return False
+        # Re-index in FTS5
+        row = self.fetchone(
+            "SELECT id FROM insights WHERE hash = ?", (insight_hash,)
+        )
+        if row:
+            self.execute(
+                "INSERT INTO insights_fts(insights_fts, rowid) VALUES('delete', ?)",
+                (row["id"],),
+            )
+            self.execute(
+                "INSERT INTO insights_fts(rowid, text, project, source, entities) "
+                "SELECT id, text, project, source, entities FROM insights WHERE id = ?",
+                (row["id"],),
+            )
+        self.commit()
+        return True
+
+    def transfer_signals(self, to_hash: str, upvotes: int = 0,
+                         downvotes: int = 0, corroboration: int = 0) -> None:
+        """Transfer aggregate signals (votes, corroboration) to a surviving insight."""
+        if upvotes or downvotes or corroboration:
+            self.execute(
+                """UPDATE insights SET upvotes = upvotes + ?,
+                       downvotes = downvotes + ?,
+                       corroboration_count = corroboration_count + ?,
+                       updated_at = datetime('now')
+                   WHERE hash = ?""",
+                (upvotes, downvotes, corroboration, to_hash),
+            )
+            self.commit()
 
     def prune_stale(self, max_age_days: int = 90, min_tier: int = 3) -> int:
         """Soft-expire insights that are old, unvoted, uncorroborated, and low-tier.

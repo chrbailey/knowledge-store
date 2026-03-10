@@ -51,11 +51,13 @@ LOG_FILE = KNOWLEDGE_DIR / "hooks" / "hook_log.jsonl"
 def log_entry(data: dict):
     try:
         LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        lines = []
-        if LOG_FILE.exists():
+        with open(LOG_FILE, "a") as f:
+            f.write(json.dumps(data, default=str) + "\n")
+        # Periodic trim: keep last 100 lines when file exceeds 150
+        if LOG_FILE.exists() and LOG_FILE.stat().st_size > 20000:
             lines = LOG_FILE.read_text().strip().splitlines()
-        lines.append(json.dumps(data, default=str))
-        LOG_FILE.write_text("\n".join(lines[-100:]) + "\n")
+            if len(lines) > 150:
+                LOG_FILE.write_text("\n".join(lines[-100:]) + "\n")
     except IOError:
         pass
 
@@ -183,23 +185,37 @@ def is_noise(text: str) -> bool:
 # Each tier maps to a confidence score. Combined with salience
 # and votes, this creates a preference-labeled dataset.
 
-TIERS = [
-    (1, [
-        (r"★\s*Insight[─\s\n]*(.*?)(?=─{5,}|$)", True),
-        (r"(?:Key (?:insight|finding|takeaway)|Important):\s*(.+?)(?:\n\n|$)", False),
-    ]),
-    (2, [
-        (r"(?:discovered|found|realized|learned)\s+that\s+(.{40,250}?)(?:\.|!|\n\n)", False),
-        (r"(?:root cause|the (?:issue|problem|bug) (?:is|was)|solution is|fix (?:is|was))\s*[:\-]?\s*(.{30,300}?)(?:\.|!|\n\n)", False),
-        (r"(?:this (?:means|indicates|works because)|the reason is)\s+(.{40,250}?)(?:\.|!|\n\n)", False),
-        (r"[Tt]his works (?:by|because)\s+(.{40,250}?)(?:\.|!|\n\n)", False),
-    ]),
-    (3, [
-        (r"(?:importantly|notably|significantly)[,:\s]+(.{40,250}?)(?:\.|!|\n\n)", False),
-        (r"[Nn]ote that\s+(.{40,250}?)(?:\.|!|\n\n)", False),
-        (r"(.{40,250}?(?:trade-off|tradeoff).{0,150}?)(?:\.|!|\n\n)", False),
-    ]),
-]
+def _compile_tiers():
+    """Pre-compile tier patterns at module load time."""
+    _base_flags = re.IGNORECASE | re.MULTILINE
+    raw = [
+        (1, [
+            (r"★\s*Insight[─\s\n]*(.*?)(?=─{5,}|$)", True),
+            (r"(?:Key (?:insight|finding|takeaway)|Important):\s*(.+?)(?:\n\n|$)", False),
+        ]),
+        (2, [
+            (r"(?:discovered|found|realized|learned)\s+that\s+(.{40,250}?)(?:\.|!|\n\n)", False),
+            (r"(?:root cause|the (?:issue|problem|bug) (?:is|was)|solution is|fix (?:is|was))\s*[:\-]?\s*(.{30,300}?)(?:\.|!|\n\n)", False),
+            (r"(?:this (?:means|indicates|works because)|the reason is)\s+(.{40,250}?)(?:\.|!|\n\n)", False),
+            (r"[Tt]his works (?:by|because)\s+(.{40,250}?)(?:\.|!|\n\n)", False),
+        ]),
+        (3, [
+            (r"(?:importantly|notably|significantly)[,:\s]+(.{40,250}?)(?:\.|!|\n\n)", False),
+            (r"[Nn]ote that\s+(.{40,250}?)(?:\.|!|\n\n)", False),
+            (r"(.{40,250}?(?:trade-off|tradeoff).{0,150}?)(?:\.|!|\n\n)", False),
+        ]),
+    ]
+    compiled = []
+    for tier, patterns in raw:
+        cp = []
+        for pattern, use_dotall in patterns:
+            flags = _base_flags | re.DOTALL if use_dotall else _base_flags
+            cp.append(re.compile(pattern, flags))
+        compiled.append((tier, cp))
+    return compiled
+
+
+TIERS = _compile_tiers()
 
 PERSONAL_INDICATORS = [
     re.compile(p, re.IGNORECASE) for p in [
@@ -232,11 +248,8 @@ def extract_insights(messages: List[dict]) -> List[dict]:
             content = content[:15000]
 
             for tier, patterns in TIERS:
-                for pattern, use_dotall in patterns:
-                    flags = re.IGNORECASE | re.MULTILINE
-                    if use_dotall:
-                        flags |= re.DOTALL
-                    for match in re.findall(pattern, content, flags):
+                for compiled_pat in patterns:
+                    for match in compiled_pat.findall(content):
                         text = match.strip() if isinstance(match, str) else str(match).strip()
                         if len(text) < 40 or len(text) > 500:
                             continue
@@ -269,30 +282,43 @@ def extract_insights(messages: List[dict]) -> List[dict]:
 
 # ── Salience: how important was this topic in the conversation? ──
 
-def compute_salience(text: str, messages: List[dict], tier: int) -> float:
-    stop_words = {
-        "that", "this", "with", "from", "have", "been", "were", "they",
-        "their", "which", "about", "would", "there", "these", "other",
-        "into", "more", "when", "some", "than", "them", "also", "just",
-    }
+_SALIENCE_STOP_WORDS = {
+    "that", "this", "with", "from", "have", "been", "were", "they",
+    "their", "which", "about", "would", "there", "these", "other",
+    "into", "more", "when", "some", "than", "them", "also", "just",
+}
+
+_SALIENCE_MARKERS = [
+    re.compile(m, re.IGNORECASE) for m in [
+        r"\bkey insight\b", r"\bimportant\b", r"\bcritical\b",
+        r"\broot cause\b", r"\bfundamental\b", r"\bbreakthrough\b",
+    ]
+]
+
+
+def precompute_salience_context(messages: List[dict]) -> tuple:
+    """Pre-compute shared context for salience scoring. Call once per session."""
+    all_text = [get_text(m) for m in messages[-50:]]
+    all_text_lower = [t.lower() for t in all_text if t]
+    full_context = " ".join(all_text_lower)
+    marker_count = sum(1 for m in _SALIENCE_MARKERS if m.search(full_context))
+    return all_text_lower, marker_count
+
+
+def compute_salience(text: str, ctx: tuple, tier: int) -> float:
+    all_text_lower, marker_count = ctx
     words = re.findall(r'\b[a-z]{4,}\b', text.lower())
-    keywords = [w for w in words if w not in stop_words][:5]
+    keywords = [w for w in words if w not in _SALIENCE_STOP_WORDS][:5]
     if not keywords:
         return 0.3
-
-    all_text = [get_text(m) for m in messages[-50:]]
-    full_context = " ".join(t for t in all_text if t)
 
     score = 0.0
 
     # Topic persistence: what fraction of messages mention these keywords?
-    hits = sum(1 for t in all_text if t and any(kw in t.lower() for kw in keywords))
-    score += min(0.4, (hits / max(1, len(all_text))) * 2.0)
+    hits = sum(1 for t in all_text_lower if any(kw in t for kw in keywords))
+    score += min(0.4, (hits / max(1, len(all_text_lower))) * 2.0)
 
-    # Importance markers in context
-    markers = [r"\bkey insight\b", r"\bimportant\b", r"\bcritical\b",
-               r"\broot cause\b", r"\bfundamental\b", r"\bbreakthrough\b"]
-    marker_count = sum(1 for m in markers if re.search(m, full_context, re.IGNORECASE))
+    # Importance markers (pre-computed)
     score += min(0.2, marker_count * 0.05)
 
     # Tier bonus
@@ -368,16 +394,26 @@ def main():
     saved = 0
     corroborated = 0
 
-    for ins in insights:
+    # Pre-compute: batch hash existence check + salience context
+    salience_ctx = precompute_salience_context(messages)
+    hashes = [compute_insight_hash(ins["text"]) for ins in insights]
+    if hashes:
+        placeholders = ",".join("?" for _ in hashes)
+        existing_rows = db.fetchall(
+            f"SELECT hash FROM insights WHERE hash IN ({placeholders})", tuple(hashes)
+        )
+        existing_hashes = {r["hash"] for r in existing_rows}
+    else:
+        existing_hashes = set()
+
+    for ins, h in zip(insights, hashes):
         text = ins["text"]
-        h = compute_insight_hash(text)
-        existing = db.get_insight(h)
-        if existing is not None:
+        if h in existing_hashes:
             db.increment_corroboration(h)
             corroborated += 1
             continue
 
-        salience = compute_salience(text, messages, ins["tier"])
+        salience = compute_salience(text, salience_ctx, ins["tier"])
         row_id = db.upsert_insight(
             text=text,
             tier=ins["tier"],

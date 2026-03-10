@@ -40,21 +40,25 @@ from knowledge_lib.db import KnowledgeDB  # noqa: E402
 VALIDATION_LOG = Path("/Volumes/OWC drive/Knowledge/validation_log.jsonl")
 
 
+def _read_validation_log() -> list:
+    """Parse the validation log JSONL file. Returns list of entry dicts."""
+    entries = []
+    if VALIDATION_LOG.exists():
+        for line in VALIDATION_LOG.read_text().strip().splitlines():
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return entries
+
+
 def get_batch(db: KnowledgeDB, limit: int = 10) -> list:
     """Get next batch of unvalidated insights, prioritized by:
     1. Tier 3 before tier 2 (lowest quality first)
     2. Highest salience within tier (most likely to be promotable)
     3. Not yet validated (no validation_log entry)
     """
-    # Get already-validated hashes
-    validated = set()
-    if VALIDATION_LOG.exists():
-        for line in VALIDATION_LOG.read_text().strip().splitlines():
-            try:
-                entry = json.loads(line)
-                validated.add(entry.get("hash"))
-            except json.JSONDecodeError:
-                continue
+    validated = {e.get("hash") for e in _read_validation_log()}
 
     rows = db.fetchall(
         """SELECT id, hash, text, tier, confidence, salience, project,
@@ -86,29 +90,9 @@ def record_verdict(db: KnowledgeDB, insight_hash: str, verdict: str,
 
     # Apply verdict
     if verdict == "promote":
-        db.conn.execute(
-            "UPDATE insights SET tier = 1, confidence = MIN(1.0, confidence + 0.2), "
-            "updated_at = datetime('now') WHERE hash = ?",
-            (insight_hash,)
-        )
-        db.conn.commit()
-        # Re-index in FTS
-        row = db.conn.execute("SELECT id FROM insights WHERE hash = ?", (insight_hash,)).fetchone()
-        if row:
-            db.conn.execute("INSERT INTO insights_fts(insights_fts, rowid) VALUES('delete', ?)", (row[0],))
-            db.conn.execute(
-                "INSERT INTO insights_fts(rowid, text, project, source, entities) "
-                "SELECT id, text, project, source, entities FROM insights WHERE id = ?",
-                (row[0],)
-            )
-            db.conn.commit()
+        db.promote(insight_hash)
     elif verdict == "expire":
-        db.conn.execute(
-            "UPDATE insights SET expired_at = datetime('now'), updated_at = datetime('now') "
-            "WHERE hash = ?",
-            (insight_hash,)
-        )
-        db.conn.commit()
+        db.expire(insight_hash)
     # "keep" = no DB change
 
     # Log the decision
@@ -134,18 +118,13 @@ def print_status(db: KnowledgeDB):
         "SELECT COUNT(*) as cnt FROM insights WHERE expired_at IS NULL AND tier >= 2"
     )[0]["cnt"]
 
-    validated = 0
+    entries = _read_validation_log()
+    validated = len(entries)
     verdicts = {"promote": 0, "keep": 0, "expire": 0}
-    if VALIDATION_LOG.exists():
-        for line in VALIDATION_LOG.read_text().strip().splitlines():
-            try:
-                entry = json.loads(line)
-                validated += 1
-                v = entry.get("verdict", "")
-                if v in verdicts:
-                    verdicts[v] += 1
-            except json.JSONDecodeError:
-                continue
+    for entry in entries:
+        v = entry.get("verdict", "")
+        if v in verdicts:
+            verdicts[v] += 1
 
     remaining = total_validatable - validated
     print(f"Validation Progress")
