@@ -1,8 +1,10 @@
-# Knowledge Store
+# knowledge-store
 
 A local-first knowledge extraction and retrieval system for Claude Code. Every conversation becomes a data collection opportunity — insights are automatically extracted, scored, deduplicated, and surfaced in future sessions.
 
 Built on the principle that a preference-labeled dataset emerges naturally from daily AI-assisted development: tier labels are quality scores, votes are RLHF signals, corroboration is self-consistency across sessions, and salience is the attention weight.
+
+**Status:** v0.1 experimental, running in production on one machine. Core library (`knowledge_lib/`), MCP server (`server.py`) and hooks are test-covered. Hook paths and the default DB location are hardcoded for the author's workstation — see "Portability" and "What this is NOT" below before adopting.
 
 ## How It Works
 
@@ -54,9 +56,17 @@ score = 0.30 × tier_weight + 0.20 × vote_signal + 0.20 × corroboration + 0.15
 
 ### Search (FTS5 + Porter Tokenizer)
 
-```sql
+```
 rank = fts_rank × tier_weight × (1 + 0.1 × net_votes + 0.05 × corroboration) × recency_decay × (0.5 + salience)
 ```
+
+## What This Is NOT
+
+- **Not cross-platform plug-and-play.** The default DB path is `/Volumes/OWC drive/Knowledge/knowledge.db` and several hook scripts early-exit when that path is missing. Expect to edit `knowledge_lib/init_db.py` and the hook scripts before this works on another machine. See "Portability" below.
+- **Not a replacement for a hosted memory backend.** There is no sync, no multi-machine replication, no auth layer. One DB file per user.
+- **Not semantic search.** Ranking is FTS5 BM25 plus preference/corroboration/recency/salience multipliers. Good at keyword + phrase recall; will miss paraphrases that share no tokens.
+- **Not a general insight extractor.** The 3-tier regex set is tuned for Claude Code transcripts (JSONL from `~/.claude/projects/*`). Plugging a different transcript format in will require pattern tweaks.
+- **Not an MCP "emotional memory" tool.** For mood / dual-engine / governance semantics see [MyPersona](https://github.com/chrbailey/MyPersona).
 
 ## Components
 
@@ -88,24 +98,27 @@ rank = fts_rank × tier_weight × (1 + 0.1 × net_votes + 0.05 × corroboration)
 | `knowledge-dedup.py` | Manual | Deduplicate and expire stale insights |
 | `knowledge-stress-test.py` | Manual | Stress test with synthetic + real data |
 
-## Setup
+## Setup (60 seconds to tests green)
 
-### 1. Install as Claude Code Plugin
+### 1. Clone and run the tests
 
 ```bash
-# Clone into plugins directory
-git clone https://github.com/chrbailey/knowledge-store.git ~/.claude/plugins/knowledge-store
-cd ~/.claude/plugins/knowledge-store
-
-# Create virtual environment
+git clone https://github.com/chrbailey/knowledge-store.git
+cd knowledge-store
 python3 -m venv .venv
 .venv/bin/pip install pytest
-
-# Run tests
 .venv/bin/python -m pytest tests/ -q
 ```
 
-### 2. Enable Plugin
+Tests run against a temp DB — they do not touch any existing knowledge file.
+
+### 2. Install as a Claude Code plugin (optional)
+
+```bash
+git clone https://github.com/chrbailey/knowledge-store.git ~/.claude/plugins/knowledge-store
+```
+
+### 3. Enable the plugin
 
 In `~/.claude/settings.json`:
 
@@ -117,7 +130,7 @@ In `~/.claude/settings.json`:
 }
 ```
 
-### 3. Wire Up Hooks
+### 4. Wire up hooks
 
 Add to `~/.claude/settings.json` under `"hooks"`:
 
@@ -144,9 +157,20 @@ Add to `~/.claude/settings.json` under `"hooks"`:
 }
 ```
 
-### 4. Configure Database Path
+### 5. Configure the database path
 
-The database defaults to `/Volumes/OWC drive/Knowledge/knowledge.db`. To change it, edit `knowledge_lib/init_db.py` and update `DB_PATH`.
+The database defaults to `/Volumes/OWC drive/Knowledge/knowledge.db` (the author's external drive). To change it, edit `DB_PATH` in `knowledge_lib/init_db.py`. The hook scripts also include an early-exit if that directory is missing — if you re-point the DB, update the guards in `hooks/knowledge-read.py` and `hooks/knowledge-write.py` accordingly.
+
+## Portability
+
+This repo is honest about being single-machine. Anything you'd have to change to run it on a new workstation:
+
+1. `knowledge_lib/init_db.py` — `DB_PATH` constant.
+2. `hooks/knowledge-read.py` — the `if not Path("/Volumes/OWC drive").exists()` guard.
+3. `hooks/knowledge-write.py` — same guard plus transcript directory assumptions.
+4. `hooks/knowledge-export.py`, `knowledge-dedup.py`, `knowledge-validate.py`, `knowledge-stress-test.py` — check each before running, same `/Volumes/OWC drive` assumption.
+
+A future version may move these to an environment variable. Until it does: treat this as a reference implementation more than a drop-in plugin.
 
 ## Training Data Export
 
@@ -175,7 +199,7 @@ python3 hooks/knowledge-dedup.py              # execute
 
 # Validate tier 2-3 insights
 python3 hooks/knowledge-validate.py --batch 10        # get batch
-python3 hooks/knowledge-validate.py --status           # progress
+python3 hooks/knowledge-validate.py --status          # progress
 
 # Stress test (isolated DB, never touches production)
 python3 hooks/knowledge-stress-test.py
@@ -193,7 +217,11 @@ Tested against real-world data:
 
 Security validation: 0 API keys leaked, 0 secrets in output, regex patterns catch `sk-*`, `AKIA*`, JWTs, connection strings, bearer tokens. Fixed false positive on words like "risk-free" via negative lookbehind.
 
----
+## Known Limitations
+
+- **66% fragment rate in practice.** The author's own production DB (~3,400 insights as of Apr 2026) is ~66% low-value sentence fragments when audited by hand. The extraction pipeline is precision-biased at tier 1, recall-biased at tiers 2-3. A future quality gate is planned.
+- **Wiki-compiler is the primary polluter.** When chained with the author's wiki-compiler project, the extractor captures ~42% of its volume from that one source, with 86% of those being fragments. This is a per-project calibration issue, not a bug in the extractor, but worth knowing before enabling in a similar setup.
+- **No privacy redaction beyond secrets regex.** The secrets patterns catch tokens and keys, but names, emails, and internal URLs are captured verbatim. Treat the DB file as you would any other private notebook.
 
 ## Comparison: Knowledge Store vs Open Brain
 
@@ -239,6 +267,10 @@ Security validation: 0 API keys leaked, 0 secrets in output, regex patterns catc
 **Knowledge Store bets on depth**: automatic extraction with quality scoring, preference signals that accumulate over time, training data that could feed back into model improvement. Every conversation is a data collection opportunity — not just storage, but a labeled dataset with provenance.
 
 The approaches are complementary. Open Brain is a memory store. Knowledge Store is a preference dataset that happens to also be a memory store.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Security issues: [SECURITY.md](SECURITY.md). Changes: [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
