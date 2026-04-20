@@ -382,14 +382,14 @@ class TestTopInsights(TestBase):
 
     def test_top_insights_ordered(self):
         """Top insights are ordered by tier weight + votes."""
-        results = self.db.get_top_insights(limit=10, days=30)
+        results = self.db.get_top_insights(limit=10, days=3650)
         self.assertTrue(len(results) >= 1)
         # Tier 0 should be first
         self.assertEqual(results[0]["tier"], 0)
 
     def test_top_insights_limit(self):
         """Limit works."""
-        results = self.db.get_top_insights(limit=2, days=30)
+        results = self.db.get_top_insights(limit=2, days=3650)
         self.assertLessEqual(len(results), 2)
 
     def test_top_insights_recency_filter(self):
@@ -408,7 +408,7 @@ class TestTopInsights(TestBase):
             captured_at="2026-02-18T00:00:00",
             expired_at="2026-02-17T00:00:00",
         )
-        results = self.db.get_top_insights(limit=10, days=30)
+        results = self.db.get_top_insights(limit=10, days=3650)
         texts = [r["text"] for r in results]
         self.assertNotIn("Expired insight should hide", texts)
 
